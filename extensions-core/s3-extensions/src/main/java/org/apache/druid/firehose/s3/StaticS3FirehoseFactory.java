@@ -30,6 +30,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Lists;
+import org.apache.commons.io.FilenameUtils;
 import org.apache.druid.data.input.FiniteFirehoseFactory;
 import org.apache.druid.data.input.InputSplit;
 import org.apache.druid.data.input.impl.StringInputRowParser;
@@ -65,12 +66,16 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
   private final ServerSideEncryptingAmazonS3 s3Client;
   private final List<URI> uris;
   private final List<URI> prefixes;
+  private final URI baseUri;
+  private final String filter;
 
   @JsonCreator
   public StaticS3FirehoseFactory(
       @JacksonInject("s3Client") ServerSideEncryptingAmazonS3 s3Client,
       @JsonProperty("uris") List<URI> uris,
       @JsonProperty("prefixes") List<URI> prefixes,
+      @JsonProperty("baseUri") URI baseUri,
+      @JsonProperty("filter") String filter,
       @JsonProperty("maxCacheCapacityBytes") Long maxCacheCapacityBytes,
       @JsonProperty("maxFetchCapacityBytes") Long maxFetchCapacityBytes,
       @JsonProperty("prefetchTriggerBytes") Long prefetchTriggerBytes,
@@ -82,13 +87,24 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
     this.s3Client = Preconditions.checkNotNull(s3Client, "s3Client");
     this.uris = uris == null ? new ArrayList<>() : uris;
     this.prefixes = prefixes == null ? new ArrayList<>() : prefixes;
+    this.baseUri = baseUri;
+    // TODO: construct filter from base uri + provided filter
+    this.filter = filter == null ? "*" : filter;
 
     if (!this.uris.isEmpty() && !this.prefixes.isEmpty()) {
       throw new IAE("uris and prefixes cannot be used together");
     }
 
-    if (this.uris.isEmpty() && this.prefixes.isEmpty()) {
-      throw new IAE("uris or prefixes must be specified");
+    if (!this.uris.isEmpty() && baseUri != null) {
+      throw new IAE("uris and baseUri cannot be used together");
+    }
+
+    if (!this.prefixes.isEmpty() && baseUri != null) {
+      throw new IAE("prefixes and baseUri cannot be used together");
+    }
+
+    if (this.uris.isEmpty() && this.prefixes.isEmpty() && this.baseUri == null) {
+      throw new IAE("uris, prefixes, or baseUri must be specified");
     }
 
     for (final URI inputURI : this.uris) {
@@ -97,6 +113,10 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
 
     for (final URI inputURI : this.prefixes) {
       Preconditions.checkArgument("s3".equals(inputURI.getScheme()), "input uri scheme == s3 (%s)", inputURI);
+    }
+
+    if (baseUri != null) {
+      Preconditions.checkArgument("s3".equals(baseUri.getScheme()), "input uri scheme == s3 (%s", baseUri);
     }
   }
 
@@ -112,6 +132,18 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
     return prefixes;
   }
 
+  @JsonProperty
+  public URI getBaseUri()
+  {
+    return this.baseUri;
+  }
+
+  @JsonProperty
+  public String getFilter()
+  {
+    return this.filter;
+  }
+
   @Override
   protected Collection<URI> initObjects() throws IOException
   {
@@ -119,54 +151,72 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
     // Getting data is deferred until openObjectStream() is called for each object.
     if (!uris.isEmpty()) {
       return uris;
-    } else {
+    } else if (!prefixes.isEmpty()){
       final List<S3ObjectSummary> objects = new ArrayList<>();
       for (URI uri : prefixes) {
-        final String bucket = uri.getAuthority();
-        final String prefix = S3Utils.extractS3Key(uri);
-
-        try {
-          final Iterator<S3ObjectSummary> objectSummaryIterator = S3Utils.objectSummaryIterator(
-              s3Client,
-              bucket,
-              prefix,
-              MAX_LISTING_LENGTH
-          );
-          objects.addAll(Lists.newArrayList(objectSummaryIterator));
-        }
-        catch (AmazonS3Exception outerException) {
-          log.error(outerException, "Exception while listing on %s", uri);
-
-          if (outerException.getStatusCode() == 403) {
-            // The "Access Denied" means users might not have a proper permission for listing on the given uri.
-            // Usually this is not a problem, but the uris might be the full paths to input objects instead of prefixes.
-            // In this case, users should be able to get objects if they have a proper permission for GetObject.
-
-            log.warn("Access denied for %s. Try to get the object from the uri without listing", uri);
-            try {
-              final ObjectMetadata objectMetadata = s3Client.getObjectMetadata(bucket, prefix);
-
-              if (!S3Utils.isDirectoryPlaceholder(prefix, objectMetadata)) {
-                objects.add(S3Utils.getSingleObjectSummary(s3Client, bucket, prefix));
-              } else {
-                throw new IOE(
-                    "[%s] is a directory placeholder, "
-                    + "but failed to get the object list under the directory due to permission",
-                    uri
-                );
-              }
-            }
-            catch (AmazonS3Exception innerException) {
-              throw new IOException(innerException);
-            }
-          } else {
-            throw new IOException(outerException);
-          }
-        }
+        objects.addAll(getObjectSummariesForPrefix(uri));
       }
       return objects.stream().map(StaticS3FirehoseFactory::toUri).collect(Collectors.toList());
+    } else {
+      final List<S3ObjectSummary> objects = getObjectSummariesForPrefix(baseUri);
+
+      return objects.stream()
+          .filter(object -> FilenameUtils.wildcardMatch(object.getKey(), filter))
+          .map(StaticS3FirehoseFactory::toUri)
+          .collect(Collectors.toList());
     }
   }
+
+  private List<S3ObjectSummary> getObjectSummariesForPrefix(URI uri) throws IOException {
+    final String bucket = uri.getAuthority();
+    final String prefix = S3Utils.extractS3Key(uri);
+
+    try {
+      final Iterator<S3ObjectSummary> objectSummaryIterator = S3Utils.objectSummaryIterator(
+          s3Client,
+          bucket,
+          prefix,
+          MAX_LISTING_LENGTH
+      );
+      return Lists.newArrayList(objectSummaryIterator);
+    }
+    catch (AmazonS3Exception exception) {
+      log.error(exception, "Exception while listing on %s", uri);
+
+      if (exception.getStatusCode() == 403) {
+        // The "Access Denied" means users might not have a proper permission for listing on the given uri.
+        // Usually this is not a problem, but the uris might be the full paths to input objects instead of prefixes.
+        // In this case, users should be able to get objects if they have a proper permission for GetObject.
+
+        log.warn("Access denied for %s. Try to get the object from the uri without listing", uri);
+        return Collections.singletonList(getObjectSummaryForURI(uri));
+
+      } else {
+        throw new IOException(exception);
+      }
+    }
+  }
+
+  private S3ObjectSummary getObjectSummaryForURI(URI uri) throws IOException {
+    final String bucket = uri.getAuthority();
+    final String prefix = S3Utils.extractS3Key(uri);
+
+    try {
+      final ObjectMetadata objectMetadata = s3Client.getObjectMetadata(bucket, prefix);
+
+      if (!S3Utils.isDirectoryPlaceholder(prefix, objectMetadata)) {
+        return S3Utils.getSingleObjectSummary(s3Client, bucket, prefix);
+      } else {
+        throw new IOE(
+            "[%s] is a directory placeholder, but failed to get the object list under the directory due to permission",
+            uri
+        );
+      }
+    } catch (AmazonS3Exception exception) {
+      throw new IOException(exception);
+    }
+  }
+
 
   @Override
   protected InputStream openObjectStream(URI object) throws IOException
@@ -232,6 +282,8 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
 
     return Objects.equals(uris, that.uris) &&
            Objects.equals(prefixes, that.prefixes) &&
+           Objects.equals(baseUri, that.baseUri) &&
+           Objects.equals(filter, that.filter) &&
            getMaxCacheCapacityBytes() == that.getMaxCacheCapacityBytes() &&
            getMaxFetchCapacityBytes() == that.getMaxFetchCapacityBytes() &&
            getPrefetchTriggerBytes() == that.getPrefetchTriggerBytes() &&
@@ -245,6 +297,8 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
     return Objects.hash(
         uris,
         prefixes,
+        baseUri,
+        filter,
         getMaxCacheCapacityBytes(),
         getMaxFetchCapacityBytes(),
         getPrefetchTriggerBytes(),
@@ -265,6 +319,8 @@ public class StaticS3FirehoseFactory extends PrefetchableTextFilesFirehoseFactor
     return new StaticS3FirehoseFactory(
         s3Client,
         Collections.singletonList(split.get()),
+        null,
+        null,
         null,
         getMaxCacheCapacityBytes(),
         getMaxFetchCapacityBytes(),
